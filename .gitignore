@@ -6,8 +6,14 @@ __pycache__/
 # C extensions
 *.so
 
+# run info
+/entropy_correction/loss_summaries
+/entropy_correction/p_value_histograms
+/entropy_correction/pca_plots
+
 # Camilo Stuff
 /Camilo Tests/
+/synthetic_data/
 
 # Distribution / packaging
 .Python

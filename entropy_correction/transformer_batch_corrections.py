@@ -1,0 +1,617 @@
+import re
+import torch
+import math
+import random
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset, Subset
+from sklearn.model_selection import train_test_split
+
+from transformers import TransformNet
+from asses_batch_effect import batchless_entropy_estimate, fisher_kldiv, fisher_kldiv_detailed, abs_effect_estimate
+from report_on_correction import make_report, correction_scatter, batch_density_plot
+
+
+
+
+class Correction_peptide(nn.Module):
+    def __init__(self, CrossTab, emb, depth, n_batches, batch_size, test_size, minibatch_size, 
+                 random_state, reg_factor = 0, heads = 5, ff_mult = 5):
+      
+        super().__init__()
+
+        self.CrossTab = CrossTab
+        self.corrected_data = CrossTab
+        
+        ## Data embedding
+        self.TRAIN_DATA, self.TEST_DATA, self.FULL_DATA, self.METADATA = make_dataset_transformer(CrossTab = CrossTab, 
+                                                                                                  emb = emb, 
+                                                                                                  n_batches = n_batches,
+                                                                                                  test_size = test_size, 
+                                                                                                  random_state = random_state)
+        
+        self.trainloader = torch.utils.data.DataLoader(self.TRAIN_DATA, shuffle = True, 
+                                                       batch_size = minibatch_size)
+        self.testloader = torch.utils.data.DataLoader(self.TEST_DATA, shuffle = False, 
+                                                      batch_size = minibatch_size)
+        self.loader = torch.utils.data.DataLoader(self.FULL_DATA, shuffle = False, 
+                                                  batch_size = minibatch_size)
+
+        ## Important self variables
+        self.seq_length = self.METADATA['max_pep_len']
+        self.reg_factor = reg_factor
+        self.batch_size = batch_size
+        self.n_batches = n_batches
+        self.test_n = len(self.TEST_DATA)
+        self.train_n = len(self.TRAIN_DATA)
+        self.data_n = len(self.FULL_DATA)
+        self.batchless_entropy = batchless_entropy_estimate(n_batches = self.n_batches,
+                                                    batch_size = self.batch_size)
+        self.individual_distance = fisher_kldiv_detailed(self.corrected_data, self.n_batches, self.batch_size, self.batchless_entropy)
+
+        ## The network
+        self.network = TransformNet(emb = emb, seq_length = self.seq_length, depth = depth, n_batches = n_batches, 
+                                    batch_size = batch_size, heads = heads, ff_mult = ff_mult)
+        
+        ## The optimizers
+        self.optimizer = torch.optim.Adam(self.network.parameters(), lr = 1e-4, betas = (0.9, 0.999))
+
+        ## Set the weights of the final layer to zero. This is so that that the inital corrections are all zero.
+        self.network.correction[2].weight.data.fill_(0)
+        self.network.correction[2].bias.data.fill_(0)
+
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = torch.device('cpu')
+        self.network = self.network.to(self.device)
+
+
+    ## Distance based on batch effect present in data y.
+    def objective_kldiv(self, y, z):
+        loss_kl = fisher_kldiv(y-z, 
+                               self.n_batches, 
+                               self.batch_size, 
+                               self.batchless_entropy)
+        loss_kl = torch.abs(loss_kl)
+        
+        return loss_kl + self.reg_factor * torch.sum(z**2)
+
+
+    ## Computes mse. y should be 'data - prediction'.
+    def objective_mse(self, y, z):
+        y = y - z
+        return torch.sum(y**2) / (self.n_batches * self.batch_size)
+
+
+    def train_model(self, epochs, loss_cutoff = 0, report_frequency = 10, early_stopping = 100, objective = "mse", run_name = ""):
+        early_stopping_N = early_stopping // report_frequency
+        train_complete = False
+        train_loss_all = []
+        test_loss_all = []
+        full_loss_all = []
+
+        if (objective == "batch_correction"):
+            objective = self.objective_kldiv
+        elif (objective == "mse"):
+            objective  = self.objective_mse
+        else:
+            print("Must input a valid objective")
+
+        for epoch in range(epochs):
+            if ((epoch % report_frequency == 0) and not train_complete):
+                self.eval()
+                test_loss, training_loss, full_loss = 0, 0, 0
+                data_corrected = []
+                p_values = []
+                
+                for x, mask, y, _ in self.testloader:
+                    x, mask = x.clone().detach().to(self.device), mask.detach().to(self.device) 
+                    y, z = y.clone().detach().to(self.device), self.network(x, mask)
+                    loss = objective(y, z)
+                    test_loss += float(loss)
+
+                for x, mask, y, _ in self.loader:
+                    x, mask = x.clone().detach().to(self.device), mask.detach().to(self.device) 
+                    y, z = y.clone().detach().to(self.device), self.network(x, mask)
+                    loss = objective(y, z)
+                    data_corrected.append((y-z).detach().cpu())
+                    full_loss += float(loss)
+
+                for x, mask, y, _ in self.trainloader:
+                    x, mask = x.clone().detach().to(self.device), mask.detach().to(self.device) 
+                    y, z = y.clone().detach().to(self.device), self.network(x, mask)
+                    loss = objective(y, z)
+                    training_loss += float(loss)
+
+
+                test_loss = test_loss / self.test_n
+                full_loss = full_loss / (self.test_n + self.train_n)
+                test_loss_all.append(test_loss)
+                full_loss_all.append(full_loss)
+                data_corrected = torch.cat(data_corrected).detach().numpy()
+                data_corrected = pd.DataFrame(data_corrected)
+                
+                make_report(data_corrected, n_batches = self.n_batches, batch_size = self.batch_size, 
+                            prefix = run_name + "all_data_", suffix = format(epoch))
+                print("Epoch " + format(epoch) + " report : testing loss is " + format(test_loss) + 
+                      " while full loss is " + format(full_loss) + "\n")
+
+                if (full_loss < loss_cutoff):
+                    train_complete = True
+
+                if (len(test_loss_all) > early_stopping_N):
+                    ii = early_stopping_N + 1
+                    if (min(test_loss_all[-early_stopping_N:]) >= test_loss_all[-ii]):
+                        train_complete = True
+
+            training_loss = 0
+            if(not train_complete):
+                self.train()
+                for x, mask, y, _ in self.trainloader:
+                    self.optimizer.zero_grad()
+                    x, mask = x.clone().detach().to(self.device), mask.detach().to(self.device) 
+                    y, z = y.clone().detach().to(self.device), self.network(x, mask)
+                    loss = objective(y, z)
+                    loss.backward()
+                    self.optimizer.step()
+                    training_loss += float(loss)
+
+                training_loss = training_loss / (self.train_n)
+                train_loss_all.append(training_loss)
+                print("Training loss is " + format(training_loss))
+
+            if (epoch % report_frequency == 0 and epoch > 0 and not train_complete):
+                plot_index = [j * report_frequency for j in range(len(test_loss_all))]
+                plt.plot(train_loss_all, label = 'Training loss')
+                plt.plot(plot_index, test_loss_all, label = 'Testing loss')
+                plt.plot(plot_index, full_loss_all, label = 'Full loss')
+                plt.legend()
+                plot_title = "All losses epochs " + format(epoch)
+                plt.title(plot_title)
+                path = "./loss_summaries/" + plot_title + ".png"
+                plt.savefig(path)
+                plt.clf()
+
+        data_corrected_output = []
+        self.eval()
+        for x, mask, y, _ in self.loader:
+            x, mask, y = x.clone().detach().to(self.device), mask.detach().to(self.device), y.clone().detach().to(self.device)
+            z = (y - self.network(x, mask)).detach().cpu()
+
+            data_corrected_output.append(z)
+
+        data_corrected_output = torch.cat(data_corrected_output).cpu().detach().numpy()
+        data_corrected_output = pd.DataFrame(data_corrected_output)
+        data_corrected_output.index = self.CrossTab.index
+        column_mapping = dict(zip(data_corrected_output.columns, self.CrossTab.columns))
+        data_corrected_output = data_corrected_output.rename(columns = column_mapping)
+        self.corrected_data = data_corrected_output
+
+
+    def scatter_comparison(self, alpha = 0.07):
+        correction_scatter(original_data = self.CrossTab, 
+                           corrected_data = self.corrected_data, 
+                           n_batches = self.n_batches, 
+                           batch_size = self.batch_size,
+                           alpha = alpha)
+
+
+    def batch_density_plot(self, *args, corrected = False):
+        if (corrected):
+            plot_title = "Corrected"
+            data = self.corrected_data
+        else:
+            plot_title = "Original"
+            data = self.CrossTab
+        plot_title = plot_title + " batch means"
+        
+        batch_density_plot(data, self.n_batches, self.batch_size, 
+                           plot_title, *args)
+
+
+
+class Correction_data(nn.Module):
+    def __init__(self, CrossTab, depth, reg_factor, n_batches, batch_size, test_size, random_state,
+                 minibatch_size = 200, number_bench = 10, heads = 5, ff_mult = 5, train_on_all = False):
+      
+        super().__init__()
+
+        self.CrossTab = CrossTab
+        self.corrected_data = CrossTab
+        self.number_bench = number_bench
+        
+        ## Data embedding
+        self.TRAIN_DATA, self.TEST_DATA, self.FULL_DATA, self.METADATA = make_dataset_transformer(CrossTab = CrossTab, 
+                                                                                                  emb = 6, 
+                                                                                                  n_batches = n_batches,
+                                                                                                  test_size = test_size, 
+                                                                                                  random_state = random_state)
+
+        if (train_on_all):
+            print("Will train on the entire dataset.\n")
+            self.TRAIN_DATA = self.FULL_DATA
+        
+        self.trainloader = torch.utils.data.DataLoader(self.TRAIN_DATA, shuffle = True, 
+                                                       batch_size = minibatch_size)
+        self.testloader = torch.utils.data.DataLoader(self.TEST_DATA, shuffle = False, 
+                                                      batch_size = minibatch_size)
+        self.loader = torch.utils.data.DataLoader(self.FULL_DATA, shuffle = False, 
+                                                  batch_size = minibatch_size)
+        
+        # shuffled_dataset = torch.utils.data.Subset(my_dataset, torch.randperm(len(my_dataset)).tolist())
+        # dataloader = DataLoader(shuffled_dataset, batch_size=4, num_workers=4, shuffled=False)
+
+        ## Important self variables
+        self.minibatch_size = minibatch_size
+        self.n_minibatch = math.ceil(len(self.TRAIN_DATA)/minibatch_size)
+        self.reg_factor = reg_factor
+        self.batch_size = batch_size
+        self.n_batches = n_batches
+        self.train_n = len(self.TRAIN_DATA)
+        self.test_n = len(self.TEST_DATA)
+        self.data_n = len(self.FULL_DATA)
+        self.batchless_entropy = batchless_entropy_estimate(n_batches = self.n_batches,
+                                                    batch_size = self.batch_size)
+        
+        ## The network
+        self.network = TransformNet(emb = self.batch_size, seq_length = self.n_batches, depth = depth,
+                                    n_batches = self.n_batches, batch_size = self.batch_size)
+        
+        ## The optimizers
+        self.optimizer = torch.optim.Adam(self.network.parameters(), lr = 1e-4, betas = (0.9, 0.999))
+
+        ## Set the weights of the final layer to zero. This is so that that the inital corrections are all zero.
+        self.network.correction[2].weight.data.fill_(0)
+        self.network.correction[2].bias.data.fill_(0)
+
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = torch.device('cpu')
+        self.network = self.network.to(self.device)
+        self.make_metrics()
+
+    def make_metrics(self):
+        self.robust_loaders = []
+        for i in range(0, self.number_bench):
+            # new_order = list(range(0, len(self.testloader.dataset)))
+            # new_order = random.sample(new_order, k = len(new_order))
+            # print(new_order[0:10])
+            # shuffled_dataset = Subset(self.testloader.dataset, indices = new_order)
+            # self.robust_loaders += [torch.utils.data.DataLoader(shuffled_dataset, shuffle = False, 
+            #                                                     batch_size = self.minibatch_size)]
+            self.robust_loaders += [self.shuffle_loader(self.testloader)]
+
+    def compute_correction(self, y, mask):
+        y, mask = y.clone().detach().to(self.device), mask.detach().to(self.device)
+        n = len(y)
+        x = y.reshape(n, self.n_batches, self.batch_size).float()
+        z = self.network(x, mask)
+        return y, z
+
+    ## Distance based on batch effect present in data y.
+    def fisher_dist(self, y, z):
+        batch_dist = fisher_kldiv(y-z, 
+                                  self.n_batches, 
+                                  self.batch_size, 
+                                  self.batchless_entropy)
+        return(batch_dist)
+
+    def objective(self, y, z):
+        batch_dist = self.fisher_dist(y, z)
+        reg_dist = torch.sum(torch.abs(z))/(self.n_batches * self.n_minibatch)
+        reg_dist = self.reg_factor * reg_dist
+        return torch.abs(batch_dist) + reg_dist
+
+    def robust_metric(self):
+        self.eval()
+        abs_loss = 0
+        for loader in self.robust_loaders:
+            loader_loss = 0
+            for _, _, y, mask in loader:
+                    y, z = self.compute_correction(y, mask)
+                    # loss = self.objective(y, z)
+                    loss = self.fisher_dist(y, z)
+                    loader_loss += abs(float(loss))
+            abs_loss += loader_loss
+        robust_estimate = abs_loss/(len(self.robust_loaders) * len(loader.dataset))
+        return(robust_estimate)
+
+    def shuffle_loader(self, loader, A_prop = 0.65):
+        B_prop = 1 - A_prop
+        crosstab = []
+        for _, _, y, mask in loader:
+            y, z = self.compute_correction(y, mask)
+            crosstab.append(y-z)
+
+        crosstab = torch.cat(crosstab)
+        individual_distance = fisher_kldiv_detailed(crosstab, self.n_batches, self.batch_size, self.batchless_entropy)
+        individual_distance = pd.DataFrame({'index' : range(0, len(individual_distance)),
+                                            'distance' : individual_distance.detach().numpy()})
+
+        C = individual_distance.sort_values(by = 'distance', ascending = True)
+        A = C['index'].to_list()[:len(C)//2]
+        B = C['index'].to_list()[len(C)//2:]
+
+        A = random.sample(A, k = len(A)) 
+        B = random.sample(B, k = len(A))
+        n_minibatch = len(loader)
+        A_last = 0
+        B_last = 0
+
+        new_order = []
+        for minibatch_i in range(0, n_minibatch):
+            if (minibatch_i % 2 == 0):
+                new_minibatch = A[A_last:A_last + math.floor(A_prop * self.minibatch_size)] + B[B_last:B_last + math.ceil(B_prop * self.minibatch_size)]
+                A_last += math.floor(A_prop * self.minibatch_size)
+                B_last += math.ceil(B_prop * self.minibatch_size)
+                new_order += new_minibatch
+            else:
+                new_minibatch = A[A_last:A_last + math.ceil((1 - A_prop) * self.minibatch_size)] + B[B_last:B_last + math.floor((1 - B_prop) * self.minibatch_size)]
+                A_last += math.ceil(B_prop * self.minibatch_size)
+                B_last += math.floor(A_prop * self.minibatch_size)
+                new_order += new_minibatch
+        
+        # print(new_order[0:10])
+        dataset_shuffled = Subset(loader.dataset, indices = new_order)
+        new_loader = torch.utils.data.DataLoader(dataset_shuffled, shuffle = True, batch_size = self.minibatch_size)
+        return(new_loader)
+
+    def train_model(self, epochs, abs_effect_cutoff, robust_cutoff, minibatch_bias = None, report_frequency = 50, run_name = ""):
+        train_complete = False
+        train_loss_all, test_loss_all, full_loss_all = [], [], []
+        abs_train_all = []
+        abs_test_all = []
+
+
+        for epoch in range(epochs):
+            if ((epoch % report_frequency == 0) and not train_complete):
+                self.eval()
+                test_loss, full_loss, training_loss = 0, 0, 0
+                train_data_corrected = []
+                test_data_corrected = []
+                data_corrected = []
+                
+                for _, _, y, mask in self.testloader:
+                    y, z = self.compute_correction(y, mask)
+                    loss = self.fisher_dist(y, z)
+                    test_loss += abs(float(loss))
+                    test_data_corrected.append(y-z)
+
+                for _, _, y, mask in self.loader:
+                    y, z = self.compute_correction(y, mask)
+                    loss = self.fisher_dist(y, z)
+                    full_loss += abs(float(loss))
+                    data_corrected.append(y-z)
+
+                for _, _, y, mask in self.trainloader:
+                    y, z = self.compute_correction(y, mask)
+                    train_data_corrected.append(y-z)
+
+                test_loss = test_loss / self.test_n
+                full_loss = full_loss / self.data_n
+                test_loss_all.append(test_loss)
+                full_loss_all.append(full_loss)
+
+                test_data_corrected = torch.cat(test_data_corrected)
+                abs_effect_test = float(abs_effect_estimate(test_data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
+                train_data_corrected = torch.cat(train_data_corrected)
+                abs_effect_train = float(abs_effect_estimate(train_data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
+
+                abs_test_all.append(abs_effect_test)
+                abs_train_all.append(abs_effect_train)
+                data_corrected = torch.cat(data_corrected).cpu().detach().numpy()
+                data_corrected = pd.DataFrame(data_corrected)
+                
+                robust_stop_metric = self.robust_metric()
+                make_report(data_corrected, n_batches = self.n_batches, batch_size = self.batch_size, 
+                            prefix = run_name + "all_data_", suffix = format(epoch) + "_robust_" + format(robust_stop_metric) + "_abs_" + format(abs_effect_test) + "_sum_" + format(robust_stop_metric + abs_effect_test))
+                print("Epoch " + format(epoch) + " report : testing loss is " + format(test_loss) + 
+                      " while full loss is " + format(full_loss) + " and absolute effect in testing data is " + format(abs_effect_test) + "\n")
+
+                
+                if (abs_effect_test < abs_effect_cutoff):
+                    train_complete = True
+
+                if (minibatch_bias is not None):
+                    self.trainloader = self.shuffle_loader(self.trainloader, minibatch_bias)
+
+                if (robust_stop_metric < robust_cutoff):
+                    train_complete = True
+
+            if (not train_complete):
+                self.train()
+                training_loss = 0
+                ## The training is done here.
+                for _, _, y, mask in self.trainloader:
+                    self.optimizer.zero_grad()
+                    y, z = self.compute_correction(y, mask)
+                    loss = self.objective(y, z)
+                    loss.backward()
+                    self.optimizer.step()
+                    training_loss += float(loss)
+
+                training_loss = training_loss / self.train_n
+                train_loss_all.append(training_loss)
+                print("Training loss is " + format(training_loss))
+
+            if (epoch % report_frequency == 0 and epoch > 0 and not train_complete):
+                ## We also make a plot of the training, testing and full losses during training.
+                fig, plots = plt.subplots(1, 2, figsize = (10,5))
+
+                plot_index = [j * report_frequency for j in range(len(test_loss_all))]
+                plots[0].plot(train_loss_all, label = 'Train loss')
+                plots[0].plot(plot_index, test_loss_all, label = 'Test loss')
+                plots[0].legend()
+                plots[0].set_title("Network loss")
+                plot_index = [j * report_frequency for j in range(len(abs_train_all))]
+                plots[1].plot(plot_index, abs_train_all, label = "Train abs effect")
+                plots[1].plot(plot_index, abs_test_all, label = "Test abs effect")
+                plots[1].legend()
+                plots[1].set_title("Absolute effect estimate")
+                
+                plot_title = "All losses epochs " + format(epoch)
+                fig.suptitle(plot_title)
+                path = "./loss_summaries/" + run_name + "_" + plot_title + ".png"
+                fig.savefig(path)
+                fig.clf()
+                plt.close(fig)
+
+        ## Finished loop, saving corrected data
+        data_corrected_output = []
+        self.eval()
+        for _, _, y, mask in self.loader:
+            y, z = self.compute_correction(y, mask)
+
+            data_corrected_output.append(y-z)
+
+        ## Place corrected data into data frame
+        data_corrected_output = torch.cat(data_corrected_output).cpu().detach().numpy()
+        data_corrected_output = pd.DataFrame(data_corrected_output)
+        data_corrected_output.index = self.CrossTab.index
+        column_mapping = dict(zip(data_corrected_output.columns, self.CrossTab.columns))
+        data_corrected_output = data_corrected_output.rename(columns = column_mapping)
+        self.corrected_data = data_corrected_output
+
+    
+    def scatter_comparison(self, alpha = 0.07):
+        correction_scatter(original_data = self.CrossTab, 
+                           corrected_data = self.corrected_data, 
+                           n_batches = self.n_batches, 
+                           batch_size = self.batch_size,
+                           alpha = alpha)
+
+
+    def batch_density_plot(self, *args, corrected = False):
+        if (corrected):
+            plot_title = "Corrected"
+            data = self.corrected_data
+        else:
+            plot_title = "Original"
+            data = self.CrossTab
+        plot_title = plot_title + " batch means"
+        
+        batch_density_plot(data, self.n_batches, self.batch_size, 
+                           plot_title, *args)
+
+                          
+
+
+
+
+
+## Helper function for making the dataset used by the networks. Made from CrossTab coming out of R.
+## The rows of the pandas dataset x represent peptides, and columns represent samples.
+def make_dataset_transformer(CrossTab, emb, n_batches, random_state, test_size = 0.20, start_char = "!", padding = "$"):
+    ## The "^" character is needed for the amino acids to be extracted from each string properly.
+    x = CrossTab
+    pattern_dict = "[^a-z*$A-Z0-9!;_-]*"
+
+    ## Helper function to encode position
+    def positional_encoding(emb, seq_length, base = 1000):
+        encoding = []
+        for pos in range(seq_length):
+            pos_enc = []
+            N = int(emb/2)
+            for i in range(N):
+                pos_enc = np.append(pos_enc, [math.cos(pos / (base ** (2*i/emb))),
+                                              math.sin(pos / (base ** (2*i/emb)))])
+            encoding.append(pos_enc)
+
+        encoding = torch.tensor(np.array(encoding))
+        return(encoding)
+
+
+    ## Helper function for splitting feature names into characters
+    def split_helper(feature_name):
+        return list(filter(None, re.split(pattern_dict, feature_name)))
+
+        
+    ## Helper function for masking the appended padding tokens '$'.
+    def mask_helper(seq_length, max_pep_length):
+        mask = []
+        for i in range(max_pep_length):
+            new_row = [float(0)] * seq_length + [float('inf')] * (max_pep_length - seq_length)
+            mask.append(new_row)
+        return(mask)
+            
+    x.columns = x.columns.astype(str)
+    x = x.dropna() # TODO: warning message here
+
+    feature_names_og = x.index
+    max_pep_length = max(feature_names_og.map(len))
+    ## Adding padding to make all peptide sequences the same length
+    feature_names = [start_char + feature_name + padding*(max_pep_length - len(feature_name)) 
+                                                        for feature_name in feature_names_og]
+    ## Have to refresh the value, as we put a start_char above
+    max_pep_length += 1
+
+    masks_peptide = []
+    masks_data = []
+    ## Have to add 1 because we placed a special token "!" to the beginning of each peptide
+    for feature_name in feature_names_og:
+      masks_peptide.append(mask_helper(len(feature_name) + 1, max_pep_length))
+      masks_data.append(mask_helper(n_batches, n_batches))
+    masks_peptide = torch.tensor(masks_peptide)
+    masks_data = torch.tensor(masks_data)
+    sample_names  = x.columns
+    n_features   = len(x) 
+
+    symbols = ''
+
+    for i in range(n_features): 
+      symbols = symbols + feature_names[i]
+
+    symbols = ''.join(set(symbols))
+    symbols = list(filter(None, re.split(pattern_dict, symbols)))
+    symbols_dict = {}
+
+    j = 0
+    ## This dictionary will translate the symbols to integers.
+    for xx in symbols:
+      symbols_dict[xx] = j
+      j += 1
+
+    n_letters = len(symbols_dict)
+
+    feature_names = list(map(split_helper, feature_names))
+    feature_names = [[symbols_dict[key] for key in feature_name] for feature_name in feature_names]   
+    feature_names = torch.tensor(feature_names) 
+    positions = positional_encoding(emb, max_pep_length)
+    positions = positions.repeat(n_features, 1, 1).float()
+
+    embedding = torch.nn.Embedding(n_letters, emb)
+    embedded = embedding(feature_names) + positions
+
+    x = torch.tensor(x.values)
+    dataset = TensorDataset(embedded, masks_peptide, x, masks_data) # convert to tensor
+    train_idx, test_idx = train_test_split(range(n_features), # make indices
+                                          test_size = test_size,
+                                          random_state = random_state)
+
+    train_dataset = Subset(dataset, train_idx) # generate subset based on indices
+    test_dataset  = Subset(dataset, test_idx)
+
+    metadata = {
+      'feature_names_og' : feature_names_og,
+      'feature_names'    : feature_names,
+      'positions'        : positions,
+      'sample_names'     : sample_names,
+      'n_features'       : n_features,
+      'max_pep_len'      : max_pep_length, 
+      'train_idx'        : train_idx,
+      'test_idx'         : test_idx,
+      'symbols_dict'     : symbols_dict,
+      'symbol_embedding' : embedding
+      }
+      
+    return train_dataset, test_dataset, dataset, metadata
+
+
+
