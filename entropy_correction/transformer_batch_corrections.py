@@ -134,7 +134,7 @@ class Correction_peptide(nn.Module):
                 full_loss = full_loss / (self.test_n + self.train_n)
                 test_loss_all.append(test_loss)
                 full_loss_all.append(full_loss)
-                data_corrected = torch.cat(data_corrected).detach().numpy()
+                data_corrected = torch.cat(data_corrected).cpu().detach().numpy()
                 data_corrected = pd.DataFrame(data_corrected)
                 
                 make_report(data_corrected, n_batches = self.n_batches, batch_size = self.batch_size, 
@@ -333,7 +333,7 @@ class Correction_data(nn.Module):
         crosstab = torch.cat(crosstab)
         individual_distance = fisher_kldiv_detailed(crosstab, self.n_batches, self.batch_size, self.batchless_entropy)
         individual_distance = pd.DataFrame({'index' : range(0, len(individual_distance)),
-                                            'distance' : individual_distance.detach().numpy()})
+                                            'distance' : individual_distance.cpu().detach().numpy()})
 
         C = individual_distance.sort_values(by = 'distance', ascending = True)
         A = C['index'].to_list()[:len(C)//2]
