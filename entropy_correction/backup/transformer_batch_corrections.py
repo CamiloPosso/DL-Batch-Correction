@@ -86,8 +86,7 @@ class Correction_data(nn.Module):
         resampled_data = make_resampled_dataset(CrossTab = CrossTab_train, n_batches = self.n_batches, 
                                                 minibatch_size = self.minibatch_size, n_stack = 10, 
                                                 test_size = 0, random_state = self.random_state)
-        self.resampled_loader = torch.utils.data.DataLoader(resampled_data, shuffle = True, batch_size = megabatch_size)
-        self.train_n = len(self.resampled_loader)
+        self.trainloader = torch.utils.data.DataLoader(resampled_data, shuffle = True, batch_size = megabatch_size)
 
     def make_metrics(self):
         self.robust_loaders = []
@@ -205,7 +204,7 @@ class Correction_data(nn.Module):
             if ((epoch % report_frequency == 0) and not train_complete):
                 self.eval()
                 test_loss, full_loss, training_loss = 0, 0, 0
-                train_data_corrected = []
+                # train_data_corrected = []
                 test_data_corrected = []
                 data_corrected = []
                 
@@ -221,9 +220,9 @@ class Correction_data(nn.Module):
                     full_loss += abs(float(loss))
                     data_corrected.append(y-z)
 
-                for _, _, y, mask in self.trainloader:
-                    y, z = self.compute_correction(y, mask)
-                    train_data_corrected.append(y-z)
+                # for _, _, y, mask in self.trainloader:
+                #     y, z = self.compute_correction(y, mask)
+                #     train_data_corrected.append(y-z)
 
                 test_loss = test_loss / self.test_n
                 full_loss = full_loss / self.data_n
@@ -232,11 +231,11 @@ class Correction_data(nn.Module):
 
                 test_data_corrected = torch.cat(test_data_corrected)
                 abs_effect_test = float(abs_effect_estimate(test_data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
-                train_data_corrected = torch.cat(train_data_corrected)
-                abs_effect_train = float(abs_effect_estimate(train_data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
+                # train_data_corrected = torch.cat(train_data_corrected)
+                # abs_effect_train = float(abs_effect_estimate(train_data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
 
                 abs_test_all.append(abs_effect_test)
-                abs_train_all.append(abs_effect_train)
+                # abs_train_all.append(abs_effect_train)
                 data_corrected = torch.cat(data_corrected).cpu().detach().numpy()
                 data_corrected = pd.DataFrame(data_corrected)
                 
@@ -261,7 +260,7 @@ class Correction_data(nn.Module):
                 training_loss = 0
                 ## The training is done here.
                 if self.resampled:
-                    for y, mask in self.resampled_loader:
+                    for y, mask in self.trainloader:
                         self.optimizer.zero_grad()
                         y, z = self.compute_correction(y, mask)
                         loss = self.reg_objective(y, z)
@@ -291,7 +290,7 @@ class Correction_data(nn.Module):
                 plots[0].legend()
                 plots[0].set_title("Network loss")
                 plot_index = [j * report_frequency for j in range(len(abs_train_all))]
-                plots[1].plot(plot_index, abs_train_all, label = "Train abs effect")
+                # plots[1].plot(plot_index, abs_train_all, label = "Train abs effect")
                 plots[1].plot(plot_index, abs_test_all, label = "Test abs effect")
                 plots[1].legend()
                 plots[1].set_title("Absolute effect estimate")
