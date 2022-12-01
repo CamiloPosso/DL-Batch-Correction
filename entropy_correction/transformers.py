@@ -37,7 +37,11 @@ class SelfAttention(nn.Module):
         ## b is the minibatch number. This is how many sequences are fed into the network
         ## t is the length of the sequences that are passed to the network. In our case, something like max peptide length in dataset.
         ## e will be the embedding dimension of the letters in the alphabet. Likely something like 5 or so, as there's only ~20 amino acids. (??)
-        b, t, e = x.size()
+        # b, t, e = x.size()
+        x_dim = x.dim()
+        e = x.size(x.dim()-1)
+        t = x.size(x.dim()-2)
+        b = x.size(x.dim()-3)
 
         ## Completely independent parameter from the input in principle.
         h = self.heads
@@ -45,40 +49,56 @@ class SelfAttention(nn.Module):
 
         ## The output from all attention heads is concatenated. So the sizes are reshaped to split into the
         ## number of heads h.
-        keys    = self.tokeys(x)   .view(b, t, h, e)
-        queries = self.toqueries(x).view(b, t, h, e)
-        values  = self.tovalues(x) .view(b, t, h, e)
+        view_args = []
+        for index in range(0, x_dim-3):
+            view_args = view_args + [x.size(index)]
+        view_args = view_args + [b, t, h, e]
+        keys    = self.tokeys(x)   .view(*view_args)
+        queries = self.toqueries(x).view(*view_args)
+        values  = self.tovalues(x) .view(*view_args)
 
         # compute scaled dot-product self-attention
 
         # - fold heads into the batch dimension
         ## The weight matrices are computed all together. This is why the keys, queries and values are concatenated.
-        keys = keys.transpose(1, 2).contiguous().view(b * h, t, e)
-        queries = queries.transpose(1, 2).contiguous().view(b * h, t, e)
-        values = values.transpose(1, 2).contiguous().view(b * h, t, e)
+        view_args = []
+        for index in range(0, x_dim-3):
+            view_args = view_args + [x.size(index)]
+        view_args = view_args + [b * h, t, e]
+        keys = keys.transpose(x_dim-2, x_dim-1).contiguous().view(*view_args)
+        queries = queries.transpose(x_dim-2, x_dim-1).contiguous().view(*view_args)
+        values = values.transpose(x_dim-2, x_dim-1).contiguous().view(*view_args)
 
         # - get dot product of queries and keys, and scale
         ## The matrix 'dot' represents the weights used when transforming the original input. 
         ## All the heads are contained here, in the first (zero-th) dimension of the tensor.
-        dot = torch.bmm(queries, keys.transpose(1, 2))
+        dot = torch.matmul(queries, keys.transpose(x_dim-2, x_dim-1))
         dot = dot / math.sqrt(e) # dot contains b*h  t-by-t matrices with raw self-attention logits
+        
+        assert dot.size()[-3:] == (b*h, t, t), f'Matrix has size {dot.size()}, expected {(b*h, t, t)}.'
 
-        assert dot.size() == (b*h, t, t), f'Matrix has size {dot.size()}, expected {(b*h, t, t)}.'
-
-        mask = mask.repeat_interleave(h, 0)
-        dot = F.softmax(dot - mask, dim=2) # dot now has row-wise self-attention probabilities
+        mask = mask.repeat_interleave(h, x_dim-3)
+        dot = F.softmax(dot - mask, dim = x_dim-1) # dot now has row-wise self-attention probabilities
 
         ## This line from the original code was causing an error. Seems to be an NA check. Will add later.
         ## OLD LINE - assert not former.util.contains_nan(dot[:, 1:, :]) # only the forst row may contain nan
 
         # apply the self attention to the values
-        out = torch.bmm(dot, values).view(b, h, t, e)
+        view_args = []
+        for index in range(0, x_dim-3):
+            view_args = view_args + [x.size(index)]
+        view_args = view_args + [b, h, t, e]
+        out = torch.matmul(dot, values).view(*view_args)
 
         # swap h, t back, unify heads
         ## The weight matrices are used to transform the original sequence of inputs. Here, we use the weight matrices
         ## from each attention head to transform the input vectors x_1,...,x_t into h * t many vectors y, each of dimension e. This is
         ## then expressed as b observations of t vectors, each of dimension h*e.
-        out = out.transpose(1, 2).contiguous().view(b, t, h * e)
+        view_args = []
+        for index in range(0, x_dim-3):
+            view_args = view_args + [x.size(index)]
+        view_args = view_args + [b, t, h * e]
+        out = out.transpose(x_dim-2, x_dim-1).contiguous().view(*view_args)
 
         ## Finally these vectors are all passed to a single linear layer to be compressed down into t vectors.
         return self.unifyheads(out)
@@ -166,11 +186,12 @@ class TransformNet(nn.Module):
     def forward(self, x, mask):
 
         x = self.transformers(x, mask)
+        x_dim = x.dim()
         ## We take all the output from the transformer when making correction
-        x = torch.flatten(x, 1, 2)
+        x = torch.flatten(x, x_dim-2, x_dim-1)
 
         x = self.correction(x)
-        x = x.repeat_interleave(self.batch_size, 1)
+        x = x.repeat_interleave(self.batch_size, x_dim-2)
 
         return x
 
