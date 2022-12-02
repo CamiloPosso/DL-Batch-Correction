@@ -194,17 +194,18 @@ class Correction_data(nn.Module):
         new_loader = torch.utils.data.DataLoader(dataset_shuffled, shuffle = True, batch_size = self.minibatch_size)
         return(new_loader)
 
-    def train_model(self, epochs, abs_effect_cutoff, minibatch_bias = None, report_frequency = 50, run_name = ""):
+    def train_model(self, epochs, abs_effect_cutoff, resample_training = None, minibatch_bias = None, report_frequency = 50, run_name = ""):
         train_complete = False
         train_loss_all, test_loss_all, full_loss_all = [], [], []
         abs_train_all = []
         abs_test_all = []
+        training_loss = 0
 
 
         for epoch in range(epochs):
             if ((epoch % report_frequency == 0) and not train_complete):
                 self.eval()
-                test_loss, full_loss, training_loss = 0, 0, 0
+                test_loss, full_loss = 0, 0
                 train_data_corrected = []
                 test_data_corrected = []
                 data_corrected = []
@@ -242,7 +243,7 @@ class Correction_data(nn.Module):
                 
                 # robust_stop_metric = self.robust_metric()
                 make_report(data_corrected, n_batches = self.n_batches, batch_size = self.batch_size, 
-                            prefix = run_name + "all_data_", suffix = format(epoch) + "_abs_" + format(abs_effect_test))
+                            prefix = run_name + "all_data_", suffix = format(epoch) + "_abs_" + format(abs_effect_test) + "_trainloss_" + format(training_loss))
                 print("Epoch " + format(epoch) + " report : testing loss is " + format(test_loss) + 
                       " while full loss is " + format(full_loss) + " and absolute effect in testing data is " + format(abs_effect_test) + "\n")
 
@@ -252,6 +253,9 @@ class Correction_data(nn.Module):
 
                 if (minibatch_bias is not None):
                     self.trainloader = self.shuffle_loader(self.trainloader, minibatch_bias)
+
+                if resample_training is not None:
+                    self.resampled_training(resample_training)
 
                 # if (robust_stop_metric < robust_cutoff):
                 #     train_complete = True
