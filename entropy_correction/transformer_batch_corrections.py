@@ -13,13 +13,13 @@ from torch.utils.data import DataLoader, TensorDataset, Subset
 from sklearn.model_selection import train_test_split
 
 from transformers import TransformNet
-from asses_batch_effect import batchless_entropy_estimate, fisher_kldiv, abs_effect_estimate
+from asses_batch_effect import batchless_entropy_estimate, batchless_entropy_distribuions, fisher_kldiv, abs_effect_estimate, compute_F_stat
 from report_on_correction import make_report, correction_scatter, batch_density_plot
 
 
 class Correction_data(nn.Module):
-    def __init__(self, CrossTab, depth, reg_factor, n_batches, batch_size, test_size, random_state,
-                 minibatch_size = 200, number_bench = 10, heads = 5, ff_mult = 5, train_on_all = False):
+    def __init__(self, CrossTab, depth, reg_factor, n_batches, batch_size, test_size, random_state, window, n_overlap,
+                 minibatch_size = 200, number_bench = 10, train_on_all = False):
       
         super().__init__()
 
@@ -28,6 +28,7 @@ class Correction_data(nn.Module):
         self.corrected_data = CrossTab
         self.number_bench = number_bench
         self.random_state = random_state
+        self.finetune_training = False
         
         ## Data embedding
         self.TRAIN_DATA, self.TEST_DATA, self.FULL_DATA, self.METADATA = make_dataset_transformer(CrossTab = CrossTab, 
@@ -46,9 +47,16 @@ class Correction_data(nn.Module):
                                                       batch_size = minibatch_size)
         self.loader = torch.utils.data.DataLoader(self.FULL_DATA, shuffle = False, 
                                                   batch_size = minibatch_size)
+        self.finetune_loaders = []
         
         # shuffled_dataset = torch.utils.data.Subset(my_dataset, torch.randperm(len(my_dataset)).tolist())
         # dataloader = DataLoader(shuffled_dataset, batch_size=4, num_workers=4, shuffled=False)
+
+        ## Normalizing reg factor using mean magnitude of the batch means
+        self.original_batch_means = torch.tensor(CrossTab.values).view([len(torch.tensor(CrossTab.values)), n_batches, batch_size])
+        self.original_batch_means = torch.mean(self.original_batch_means, 2)
+        self.original_batch_means = float(torch.mean(torch.abs(self.original_batch_means)))
+                                            
 
         ## Important self variables
         self.minibatch_size = minibatch_size
@@ -61,6 +69,7 @@ class Correction_data(nn.Module):
         self.data_n = len(self.FULL_DATA)
         self.batchless_entropy, self.batchless_entropy_std = batchless_entropy_estimate(n_batches = self.n_batches,
                                                                                         batch_size = self.batch_size)
+        self.batchless_entropy_distributions = []
         
         ## The network
         self.network = TransformNet(emb = self.batch_size, seq_length = self.n_batches, depth = depth,
@@ -68,6 +77,7 @@ class Correction_data(nn.Module):
         
         ## The optimizers
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr = 1e-4, betas = (0.9, 0.999))
+        # self.optimizer = torch.optim.Adam(self.network.parameters(), lr = 1e-5, betas = (0.9, 0.999))
 
         ## Set the weights of the final layer to zero. This is so that that the inital corrections are all zero.
         self.network.correction[2].weight.data.fill_(0)
@@ -78,16 +88,43 @@ class Correction_data(nn.Module):
         else:
             self.device = torch.device('cpu')
         self.network = self.network.to(self.device)
-        self.make_metrics()
+        # self.make_metrics()
 
-    def resampled_training(self, megabatch_size = 20):
+    def resampled_training(self, megabatch_size):
         self.resampled = True
         CrossTab_train = self.CrossTab.iloc[self.METADATA['train_idx']]
+        CrossTab_test = self.CrossTab.iloc[self.METADATA['test_idx']]
         resampled_data = make_resampled_dataset(CrossTab = CrossTab_train, n_batches = self.n_batches, 
-                                                minibatch_size = self.minibatch_size, n_stack = 10, 
-                                                test_size = 0, random_state = self.random_state)
-        self.resampled_loader = torch.utils.data.DataLoader(resampled_data, shuffle = True, batch_size = megabatch_size)
-        self.train_n = len(self.resampled_loader)
+                                                minibatch_size = self.minibatch_size)
+        self.resampled_trainloader = torch.utils.data.DataLoader(resampled_data, shuffle = True, batch_size = megabatch_size)
+        resampled_data = make_resampled_dataset(CrossTab = CrossTab_test, n_batches = self.n_batches, 
+                                                minibatch_size = self.minibatch_size)
+        self.resampled_testloader = torch.utils.data.DataLoader(resampled_data, shuffle = False, batch_size = megabatch_size)
+        self.train_n = len(self.resampled_trainloader)
+        self.test_n = len(self.resampled_testloader)
+
+    def make_finetune_loaders(self, megabatch_size, n_div):
+        div_size = len(self.loader.dataset)//n_div
+        tensor_crosstab = []
+        for _, _, y, mask in self.loader:
+            y, z = self.compute_correction(y, mask)
+            tensor_crosstab.append(y-z)
+
+        tensor_crosstab = torch.cat(tensor_crosstab)
+        F_stat = compute_F_stat(tensor_crosstab, self.n_batches, self.batch_size)
+        F_df = pd.DataFrame({'index' : range(0, len(F_stat)), 'F_stat' : F_stat.cpu().detach().numpy()})
+
+        C = F_df.sort_values(by = 'F_stat', ascending = False)
+
+        section_loaders = [C['index'].to_list()[i*div_size:(1+i)*div_size] for i in range(0, n_div)]
+        for index, section in enumerate(section_loaders):
+            section = self.CrossTab.iloc[section]
+            resampled_data = make_resampled_dataset(CrossTab = section, n_batches = self.n_batches, 
+                                                    minibatch_size = self.minibatch_size)
+            resampled_loader = torch.utils.data.DataLoader(resampled_data, shuffle = True, batch_size = megabatch_size)
+            section_loaders[index] = resampled_loader
+        self.finetune_loaders = self.finetune_loaders + section_loaders
+        self.batchless_entropy_distributions = self.batchless_entropy_distributions + batchless_entropy_distribuions(self.n_batches, self.batch_size, n_div)
 
     def make_metrics(self):
         self.robust_loaders = []
@@ -108,37 +145,47 @@ class Correction_data(nn.Module):
         return y, z
 
     ## Distance based on batch effect present in data y.
-    def fisher_dist(self, y, z):
+    # def fisher_dist(self, y, z):
+    #     batch_dist = fisher_kldiv(y-z, 
+    #                               self.n_batches, 
+    #                               self.batch_size, 
+    #                               self.batchless_entropy)
+    #     if batch_dist.dim() > 1:
+    #         batch_dist = torch.mean(batch_dist, 1)
+    #         batch_dist = batch_dist * np.sqrt(self.minibatch_size)
+    #     return(batch_dist)
+
+    def general_objective(self, y, z, ref_mean, ref_std):
         batch_dist = fisher_kldiv(y-z, 
                                   self.n_batches, 
                                   self.batch_size, 
-                                  self.batchless_entropy)
-        if batch_dist.dim() > 1:
-            batch_dist = torch.mean(batch_dist, 1)
-            batch_dist = batch_dist * np.sqrt(self.minibatch_size)
-        return(batch_dist)
-
-    # def objective(self, y, z):
-    #     batch_dist = self.fisher_dist(y, z)
-    #     reg_dist = torch.sum(torch.abs(z))/(self.n_batches * self.n_minibatch)
-    #     reg_dist = self.reg_factor * reg_dist
-    #     return torch.abs(batch_dist) + reg_dist
-
-    def objective(self, y, z):
-        batch_dist = self.fisher_dist(y, z)
+                                  0)
         dist_mean = torch.mean(batch_dist)
         dist_std = torch.std(batch_dist, unbiased = True)
-        ref_std = self.batchless_entropy_std
 
-        gaussian_kl1 = torch.log(dist_std/ref_std) + (ref_std**2 + dist_mean**2)/(2*dist_std**2) - 1/2
-        gaussian_kl2 = torch.log(ref_std/dist_std) + (dist_std**2 + dist_mean**2)/(2*ref_std**2) - 1/2
+        gaussian_kl1 = torch.log(dist_std/ref_std) + (ref_std**2 + (dist_mean - ref_mean)**2)/(2*dist_std**2) - 1/2
+        gaussian_kl2 = torch.log(ref_std/dist_std) + (dist_std**2 + (dist_mean - ref_mean)**2)/(2*ref_std**2) - 1/2
         return gaussian_kl1 + gaussian_kl2
+
+    def objective(self, y, z):
+        # batch_dist = self.fisher_dist(y, z)
+        # dist_mean = torch.mean(batch_dist)
+        # dist_std = torch.std(batch_dist, unbiased = True)
+        # ref_std = self.batchless_entropy_std
+
+        # gaussian_kl1 = torch.log(dist_std/ref_std) + (ref_std**2 + dist_mean**2)/(2*dist_std**2) - 1/2
+        # gaussian_kl2 = torch.log(ref_std/dist_std) + (dist_std**2 + dist_mean**2)/(2*ref_std**2) - 1/2
+        return self.general_objective(y, z, -self.batchless_entropy, self.batchless_entropy_std)
         # return gaussian_kl2
 
-    def reg_objective(self, y, z):
-        raw_obj = self.objective(y, z)
-        reg_dist = torch.sum(torch.abs(z))/(self.n_batches * self.n_minibatch)
-        return raw_obj + self.reg_factor * reg_dist
+    def reg_objective(self, z):
+        reg_dist = self.reg_factor * torch.mean(torch.abs(z)) / self.original_batch_means
+        # reg_dist = reg_dist**2
+        return reg_dist
+
+    def finetune_objective(self, y, z, index):
+        batchless_dist = self.batchless_entropy_distributions[index]
+        return self.general_objective(y, z, -batchless_dist[0], batchless_dist[1])
 
     # def robust_metric(self):
     #     self.eval()
@@ -154,108 +201,119 @@ class Correction_data(nn.Module):
     #     robust_estimate = abs_loss/(len(self.robust_loaders) * len(loader.dataset))
     #     return(robust_estimate)
 
-    def shuffle_loader(self, loader, A_prop = 0.65):
-        B_prop = 1 - A_prop
-        crosstab = []
-        for _, _, y, mask in loader:
-            y, z = self.compute_correction(y, mask)
-            crosstab.append(y-z)
+    # def shuffle_loader(self, loader, A_prop = 0.65):
+    #     B_prop = 1 - A_prop
+    #     crosstab = []
+    #     for _, _, y, mask in loader:
+    #         y, z = self.compute_correction(y, mask)
+    #         crosstab.append(y-z)
 
-        crosstab = torch.cat(crosstab)
-        individual_distance = fisher_kldiv(crosstab, self.n_batches, self.batch_size, self.batchless_entropy)
-        individual_distance = pd.DataFrame({'index' : range(0, len(individual_distance)),
-                                            'distance' : individual_distance.cpu().detach().numpy()})
+    #     crosstab = torch.cat(crosstab)
+    #     individual_distance = fisher_kldiv(crosstab, self.n_batches, self.batch_size, self.batchless_entropy)
+    #     individual_distance = pd.DataFrame({'index' : range(0, len(individual_distance)),
+    #                                         'distance' : individual_distance.cpu().detach().numpy()})
 
-        C = individual_distance.sort_values(by = 'distance', ascending = True)
-        A = C['index'].to_list()[:len(C)//2]
-        B = C['index'].to_list()[len(C)//2:]
+    #     C = individual_distance.sort_values(by = 'distance', ascending = False)
+    #     A = C['index'].to_list()[:len(C)//2]
+    #     B = C['index'].to_list()[len(C)//2:]
 
-        A = random.sample(A, k = len(A)) 
-        B = random.sample(B, k = len(A))
-        n_minibatch = len(loader)
-        A_last = 0
-        B_last = 0
+    #     A = random.sample(A, k = len(A)) 
+    #     B = random.sample(B, k = len(A))
+    #     n_minibatch = len(loader)
+    #     A_last = 0
+    #     B_last = 0
 
-        new_order = []
-        for minibatch_i in range(0, n_minibatch):
-            if (minibatch_i % 2 == 0):
-                new_minibatch = A[A_last:A_last + math.floor(A_prop * self.minibatch_size)] + B[B_last:B_last + math.ceil(B_prop * self.minibatch_size)]
-                A_last += math.floor(A_prop * self.minibatch_size)
-                B_last += math.ceil(B_prop * self.minibatch_size)
-                new_order += new_minibatch
-            else:
-                new_minibatch = A[A_last:A_last + math.ceil((1 - A_prop) * self.minibatch_size)] + B[B_last:B_last + math.floor((1 - B_prop) * self.minibatch_size)]
-                A_last += math.ceil(B_prop * self.minibatch_size)
-                B_last += math.floor(A_prop * self.minibatch_size)
-                new_order += new_minibatch
+    #     new_order = []
+    #     for minibatch_i in range(0, n_minibatch):
+    #         if (minibatch_i % 2 == 0):
+    #             new_minibatch = A[A_last:A_last + math.floor(A_prop * self.minibatch_size)] + B[B_last:B_last + math.ceil(B_prop * self.minibatch_size)]
+    #             A_last += math.floor(A_prop * self.minibatch_size)
+    #             B_last += math.ceil(B_prop * self.minibatch_size)
+    #             new_order += new_minibatch
+    #         else:
+    #             new_minibatch = A[A_last:A_last + math.ceil((1 - A_prop) * self.minibatch_size)] + B[B_last:B_last + math.floor((1 - B_prop) * self.minibatch_size)]
+    #             A_last += math.ceil(B_prop * self.minibatch_size)
+    #             B_last += math.floor(A_prop * self.minibatch_size)
+    #             new_order += new_minibatch
         
-        # print(new_order[0:10])
-        dataset_shuffled = Subset(loader.dataset, indices = new_order)
-        new_loader = torch.utils.data.DataLoader(dataset_shuffled, shuffle = True, batch_size = self.minibatch_size)
-        return(new_loader)
+    #     # print(new_order[0:10])
+    #     dataset_shuffled = Subset(loader.dataset, indices = new_order)
+    #     new_loader = torch.utils.data.DataLoader(dataset_shuffled, shuffle = True, batch_size = self.minibatch_size)
+    #     return(new_loader)
 
-    def train_model(self, epochs, abs_effect_cutoff, resample_training = None, minibatch_bias = None, report_frequency = 50, run_name = ""):
+    def train_model(self, epochs, abs_effect_cutoff, finetune_training = False, resample_training = None, minibatch_bias = None, report_frequency = 50, run_name = ""):
         train_complete = False
-        train_loss_all, test_loss_all, full_loss_all = [], [], []
-        abs_train_all = []
-        abs_test_all = []
+        train_loss_all, test_loss_all = [], []
+        # abs_train_all = []
+        # abs_test_all = []
+        abs_all = []
         training_loss = 0
-
 
         for epoch in range(epochs):
             if ((epoch % report_frequency == 0) and not train_complete):
                 self.eval()
-                test_loss, full_loss = 0, 0
-                train_data_corrected = []
-                test_data_corrected = []
+                test_loss = 0
+                # train_data_corrected = []
+                # test_data_corrected = []
                 data_corrected = []
-                
-                for _, _, y, mask in self.testloader:
-                    y, z = self.compute_correction(y, mask)
-                    loss = self.objective(y, z)
-                    test_loss += abs(float(loss))
-                    test_data_corrected.append(y-z)
+
+
+                if self.resampled:
+                    for y, mask in self.resampled_testloader:
+                        y, z = self.compute_correction(y, mask)
+                        raw_loss = self.objective(y, z)
+                        test_loss += float(raw_loss)
+                else:
+                    for _, _, y, mask in self.testloader:
+                        y, z = self.compute_correction(y, mask)
+                        raw_loss = self.objective(y, z)
+                        training_loss += float(raw_loss)
 
                 for _, _, y, mask in self.loader:
                     y, z = self.compute_correction(y, mask)
-                    loss = self.objective(y, z)
-                    full_loss += abs(float(loss))
                     data_corrected.append(y-z)
 
-                for _, _, y, mask in self.trainloader:
-                    y, z = self.compute_correction(y, mask)
-                    train_data_corrected.append(y-z)
+                # for _, _, y, mask in self.trainloader:
+                #     y, z = self.compute_correction(y, mask)
+                #     train_data_corrected.append(y-z)
 
                 test_loss = test_loss / self.test_n
-                full_loss = full_loss / self.data_n
+                # full_loss = full_loss / self.data_n
                 test_loss_all.append(test_loss)
-                full_loss_all.append(full_loss)
+                # full_loss_all.append(full_loss)
 
-                test_data_corrected = torch.cat(test_data_corrected)
-                abs_effect_test = float(abs_effect_estimate(test_data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
-                train_data_corrected = torch.cat(train_data_corrected)
-                abs_effect_train = float(abs_effect_estimate(train_data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
+                data_corrected = torch.cat(data_corrected)
+                abs_effect = float(abs_effect_estimate(data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
+                # train_data_corrected = torch.cat(train_data_corrected)
+                # abs_effect_train = float(abs_effect_estimate(train_data_corrected, self.n_batches, self.batch_size, self.batchless_entropy))
 
-                abs_test_all.append(abs_effect_test)
-                abs_train_all.append(abs_effect_train)
-                data_corrected = torch.cat(data_corrected).cpu().detach().numpy()
+                abs_all.append(abs_effect)
+                # abs_train_all.append(abs_effect_train)
+                data_corrected = data_corrected.cpu().detach().numpy()
                 data_corrected = pd.DataFrame(data_corrected)
                 
                 # robust_stop_metric = self.robust_metric()
-                make_report(data_corrected, n_batches = self.n_batches, batch_size = self.batch_size, 
-                            prefix = run_name + "all_data_", suffix = format(epoch) + "_abs_" + format(abs_effect_test) + "_trainloss_" + format(training_loss))
+                make_report(data_corrected, n_batches = self.n_batches, batch_size = self.batch_size,  
+                            train_idx = self.METADATA['train_idx'], test_idx = self.METADATA['test_idx'],
+                            prefix = run_name, suffix = "_epoch_" + format(epoch) + "_abs_" + format(round(abs_effect, 5)) + 
+                                                        "_train_" + format(round(training_loss, 5)) + "_test_" + format(round(test_loss, 5)))
                 print("Epoch " + format(epoch) + " report : testing loss is " + format(test_loss) + 
-                      " while full loss is " + format(full_loss) + " and absolute effect in testing data is " + format(abs_effect_test) + "\n")
+                      " while train loss is " + format(training_loss) + " and absolute effect in testing data is " + format(abs_effect) + "\n")
 
                 
-                if (abs_effect_test < abs_effect_cutoff):
+                if abs_effect < abs_effect_cutoff:
                     train_complete = True
 
-                if (minibatch_bias is not None):
+                if minibatch_bias is not None:
                     self.trainloader = self.shuffle_loader(self.trainloader, minibatch_bias)
 
                 if resample_training is not None:
                     self.resampled_training(resample_training)
+
+                if finetune_training:
+                    self.finetune_loaders = []
+                    for n_div in self.n_divs:
+                        self.make_finetune_loaders(resample_training, n_div)
 
                 # if (robust_stop_metric < robust_cutoff):
                 #     train_complete = True
@@ -264,22 +322,46 @@ class Correction_data(nn.Module):
                 self.train()
                 training_loss = 0
                 ## The training is done here.
-                if self.resampled:
-                    for y, mask in self.resampled_loader:
-                        self.optimizer.zero_grad()
-                        y, z = self.compute_correction(y, mask)
-                        loss = self.reg_objective(y, z)
+                if finetune_training:
+                    for index in range(len(self.finetune_loaders[0])):
+                        raw_loss = 0
+                        reg_loss = 0
+                        for loader_index, finetune_loader in enumerate(self.finetune_loaders):
+                            y, mask = next(iter(finetune_loader))
+                            self.optimizer.zero_grad()
+                            y, z = self.compute_correction(y, mask)
+                            raw_loss += self.finetune_objective(y, z, loader_index)
+                            reg_loss += self.reg_objective(z)
+                        loss = raw_loss + reg_loss
                         loss.backward()
                         self.optimizer.step()
-                        training_loss += float(loss)
+                        training_loss += float(raw_loss)
+                        # for y, mask in finetune_loader:
+                            # self.optimizer.zero_grad()
+                            # y, z = self.compute_correction(y, mask)
+                            # raw_loss = self.finetune_objective(y, z, index)
+                            # loss = raw_loss + self.reg_objective(z)
+                            # loss.backward()
+                            # self.optimizer.step()
+                            # training_loss += float(raw_loss)
+                elif self.resampled:
+                    for y, mask in self.resampled_trainloader:
+                        self.optimizer.zero_grad()
+                        y, z = self.compute_correction(y, mask)
+                        raw_loss = self.objective(y, z)
+                        loss = raw_loss + self.reg_objective(z)
+                        loss.backward()
+                        self.optimizer.step()
+                        training_loss += float(raw_loss)
                 else:
                     for _, _, y, mask in self.trainloader:
                         self.optimizer.zero_grad()
                         y, z = self.compute_correction(y, mask)
-                        loss = self.reg_objective(y, z)
+                        raw_loss = self.objective(y, z)
+                        loss = raw_loss + self.reg_objective(z)
                         loss.backward()
                         self.optimizer.step()
-                        training_loss += float(loss)
+                        training_loss += float(raw_loss)
 
                 training_loss = training_loss / self.train_n
                 train_loss_all.append(training_loss)
@@ -294,9 +376,9 @@ class Correction_data(nn.Module):
                 plots[0].plot(plot_index, test_loss_all, label = 'Test loss')
                 plots[0].legend()
                 plots[0].set_title("Network loss")
-                plot_index = [j * report_frequency for j in range(len(abs_train_all))]
-                plots[1].plot(plot_index, abs_train_all, label = "Train abs effect")
-                plots[1].plot(plot_index, abs_test_all, label = "Test abs effect")
+                plot_index = [j * report_frequency for j in range(len(abs_all))]
+                plots[1].plot(plot_index, abs_all, label = "Absolute batch effect in data")
+                # plots[1].plot(plot_index, abs_test_all, label = "Test abs effect")
                 plots[1].legend()
                 plots[1].set_title("Absolute effect estimate")
                 
@@ -458,7 +540,7 @@ def make_dataset_transformer(CrossTab, emb, n_batches, random_state, test_size =
     return train_dataset, test_dataset, dataset, metadata
 
 
-def make_resampled_dataset(CrossTab, n_batches, minibatch_size, n_stack, test_size, random_state):
+def make_resampled_dataset(CrossTab, n_batches, minibatch_size, n_stack = 4):
     # train_idx, test_idx = train_test_split(range(len(CrossTab)), # make indices
     #                                     test_size = test_size,
     #                                     random_state = random_state)

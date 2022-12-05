@@ -2,6 +2,7 @@ import torch
 import math
 
 import pandas as pd
+import numpy as np
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
@@ -14,7 +15,7 @@ from asses_batch_effect import test_batch_effect_fast
 
 
 ## Function to make a PCA plot and p-value histogram of the batch effect. Takes in a pandas df.
-def make_report(data, n_batches, batch_size, prefix = "", suffix = ""):
+def make_report(data, n_batches, batch_size, train_idx, test_idx, prefix = "", suffix = ""):
     sns.set_style('whitegrid')
     sns.set_palette('Set2')
 
@@ -50,13 +51,24 @@ def make_report(data, n_batches, batch_size, prefix = "", suffix = ""):
     plt.close()
 
     p_values = test_batch_effect_fast(y, n_batches, batch_size)
-    plt.hist(p_values)
+    p_train = p_values[train_idx]
+    p_test = p_values[test_idx]
+    p_values = np.concatenate([p_train, p_test])
+    plot_data = pd.DataFrame({'p_value' : p_values, 
+                              'group' : ['train' for i in range(0, len(train_idx))] + ['test' for i in range(0, len(test_idx))]})
+
+    pval_plot = sns.histplot(data = plot_data, x = 'p_value', hue = 'group', stat = 'count')
+    # p_values_test = p_values.
+    # plt.hist(p_values)
     plot_title = prefix + "pval_hist_epoch_" + suffix
-    plt.title(plot_title)
-    plt.ylabel('Count')
-    plt.xlabel('p value')
+    # plt.title(plot_title)
+    pval_plot.set(title = plot_title, xlabel = 'p value', ylabel = 'Count')
+    # plt.ylabel('Count')
+    # plt.xlabel('p value')
     path = "./p_value_histograms/" + plot_title + ".png"
-    plt.savefig(path)
+    # plt.savefig(path)
+    pval_plot.get_figure().savefig(path) 
+
     plt.clf()
     plt.close()
 

@@ -30,7 +30,7 @@ from scipy.stats import f as fisher_dist
 #     log_F = p.log_prob(F_stat)
 #     return(log_F - batchless_entropy)
 
-def fisher_kldiv(corrected_data, n_batches, batch_size, batchless_entropy):
+def compute_F_stat(corrected_data, n_batches, batch_size):
     y = corrected_data
     y_dim = y.dim()
     # length = y.size(y_dim-2)
@@ -54,6 +54,13 @@ def fisher_kldiv(corrected_data, n_batches, batch_size, batchless_entropy):
     K = n_batches
 
     F_stat = (exp_var/unexp_var) * ((N-K) / (K-1))
+    return F_stat
+
+def fisher_kldiv(corrected_data, n_batches, batch_size, batchless_entropy):
+    N = batch_size * n_batches
+    K = n_batches
+    F_stat = compute_F_stat(corrected_data, n_batches, batch_size)
+
     p = torch.distributions.FisherSnedecor(df1 = K-1, df2 = N-K)
     log_F = p.log_prob(F_stat)
     return -(log_F - batchless_entropy)
@@ -77,8 +84,6 @@ def abs_effect_estimate(corrected_data, n_batches, batch_size, batchless_entropy
     return loss_kl
 
 
-
-
 ## y is a tensor of size (k, n_batches * batch_size)
 def test_batch_effect_fast(y, n_batches, batch_size):
     length = len(y)
@@ -99,8 +104,6 @@ def test_batch_effect_fast(y, n_batches, batch_size):
     p_values = 1 - fisher_dist.cdf(F_stat, dfn = K-1, dfd = N-K)
 
     return(p_values) 
-
-
     
 
 ## Functions for testing batch effect
@@ -119,14 +122,9 @@ def test_batch_effect(y, n_batches, batch_size):
     return(p_values)
 
 
-
-
 def batchless_entropy_estimate(n_batches, batch_size, sample_size = 7000000):
     N = batch_size * n_batches
     K = n_batches
-    # df2_test = 10000
-    # p = torch.distributions.FisherSnedecor(df1 = K-1, df2 = df2_test)
-    # F_stat = np.random.f(K-1, df2_test, sample_size)
 
     p = torch.distributions.FisherSnedecor(df1 = K-1, df2 = N-K)
     F_stat = np.random.f(K-1, N-K, sample_size)
@@ -134,18 +132,24 @@ def batchless_entropy_estimate(n_batches, batch_size, sample_size = 7000000):
     return float(torch.mean(log_F)), float(torch.std(log_F, unbiased = True))
 
 
-def batchless_entropy_distribution(n_batches, batch_size, minibatch_size, sample_size = 10000):
+def batchless_entropy_distribuions(n_batches, batch_size, n_div, sample_size = 10000000):
+    div_size = sample_size//n_div
     N = batch_size * n_batches
     K = n_batches
-    minibatch_size = 50
-    sample_size = 10000
+
     p = torch.distributions.FisherSnedecor(df1 = K-1, df2 = N-K)
-    F_stat = [numpy.random.f(K-1, N-K, minibatch_size) for index in range(0, sample_size)]
-    F_stat = numpy.stack(F_stat)
+    F_stat = np.random.f(K-1, N-K, sample_size)
     log_F = p.log_prob(torch.tensor(F_stat))
-    log_F_means = torch.mean(log_F, 1)
+    individual_distance = pd.DataFrame({'index' : range(0, len(F_stat)),
+                                    'F_stat' : F_stat,
+                                    'batch_dist' : log_F})
 
-    log_F_MEAN, log_F_STD = test.batchless_entropy, test.batchless_entropy_std
-    log_dev = log_F_means - log_F_MEAN
+    C = individual_distance.sort_values(by = 'F_stat', ascending = False)
+    natural_distributions = [C['batch_dist'].to_list()[i*div_size:(1+i)*div_size] for i in range(0, n_div)]
+    for index, dist in enumerate(natural_distributions):
+        dist = torch.tensor(dist)
+        natural_mean = float(torch.mean(dist))
+        natural_std = float(torch.std(dist, unbiased = True))
+        natural_distributions[index] = (natural_mean, natural_std)
+    return natural_distributions
 
-    return 
