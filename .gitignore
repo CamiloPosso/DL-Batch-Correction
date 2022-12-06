@@ -140,4 +140,6 @@ dmypy.json
 *~
 .Rproj.user
 entropy_correction/synthetic_data_testing.ipynb
+entropy_correction/data
+entropy_correction/Colab runs
 
